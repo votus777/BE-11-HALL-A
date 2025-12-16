@@ -102,7 +102,7 @@ def contrastive_batch_loss(chem_latent, sensory_latent, margin=0.3):
 
 
 # (옵션) InfoNCE 로스는 당분간 사용 안 하면 그대로 두고 주석 유지
-def info_nce_loss(chem_latent, sensory_latent, tau=0.09):
+def info_nce_loss(chem_latent, sensory_latent, tau=0.08):
     logits = (chem_latent @ sensory_latent.T) / tau
     labels = torch.arange(logits.size(0), device=logits.device)
     loss = F.cross_entropy(logits, labels)
@@ -322,6 +322,62 @@ def visualize_detailed_analysis(model, chem_data, sensory_data,
     plt.show()
 
 
+def build_embedding_index(model, chem_data_scaled, sensory_data_scaled):
+    """
+    학습/벨리데이션 데이터의 임베딩을 미리 계산해 인덱스로 저장.
+    chem_data_scaled, sensory_data_scaled: (N, d_x), (N, d_y) numpy
+    """
+    device = next(model.parameters()).device
+    model.eval()
+    with torch.no_grad():
+        chem_t = torch.from_numpy(chem_data_scaled).to(device)
+        sens_t = torch.from_numpy(sensory_data_scaled).to(device)
+        zc, zs = model(chem_t, sens_t)  # (N, d_latent)
+        zc = F.normalize(zc, dim=1).cpu().numpy()
+        zs = F.normalize(zs, dim=1).cpu().numpy()
+    return zc, zs  # 화학/감각 임베딩 인덱스
+
+
+def find_nearest_samples(model, chem_scaler,
+                         chem_index, sens_index,
+                         new_chem_df_row,
+                         top_k=5, use_sensory=True):
+    """
+    - model: 학습된 TwoTowerModel
+    - chem_scaler: 학습 때 쓴 StandardScaler (화학용)
+    - chem_index, sens_index: build_embedding_index에서 만든 (N,d) 배열
+    - new_chem_df_row: pandas Series or dict 형태의 새 화학 샘플 (6개 피처)
+    - use_sensory=True면 감각 임베딩(sens_index) 기준으로 검색, False면 화학 임베딩(chem_index) 기준
+    """
+    device = next(model.parameters()).device
+    model.eval()
+
+    # 1) 새 샘플 전처리 (chem_cols 순서에 맞춰 정렬되어 있다고 가정)
+    new_x = np.array(new_chem_df_row, dtype=np.float32).reshape(1, -1)
+    new_x_scaled = chem_scaler.transform(new_x)
+
+    # 2) 새 샘플 임베딩 계산
+    with torch.no_grad():
+        chem_t = torch.from_numpy(new_x_scaled).to(device)
+        # sensory 입력은 dummy로 넘겨도 되지만, encoder만 쓰기 위해 None 처리
+        new_zc = model.chem_encoder(chem_t)
+        new_zc = F.normalize(new_zc, dim=1).cpu().numpy()[0]  # (d_latent,)
+
+    # 3) 어떤 인덱스를 기준으로 검색할지 선택
+    base_index = sens_index if use_sensory else chem_index  # (N, d_latent)
+
+    # 4) 코사인 유사도 계산 (벡터 vs 전체 인덱스)
+    sims = base_index @ new_zc  # (N,)  — 이미 정규화되어 있으면 내적 = 코사인
+
+    # 5) 상위 K개 인덱스 추출
+    topk_idx = np.argsort(-sims)[:top_k]
+    topk_sims = sims[topk_idx]
+
+    return topk_idx, topk_sims  # (가까운 샘플 인덱스, 유사도)
+
+
+
+
 # 7. 전체 실행 스크립트
 # ============================================
 
@@ -346,7 +402,7 @@ def main():
     model = train_model(
         chem_train_scaled,
         sensory_train_scaled,
-        n_epochs=200,
+        n_epochs=300,
         batch_size=32,
         lr=1e-3
     )
@@ -356,6 +412,26 @@ def main():
 
     visualize_detailed_analysis(model, chem_val_scaled, sensory_val_scaled)
 
+
+        # 1) 인덱스 미리 계산 (학습 끝난 후 한 번만)
+    chem_index, sens_index = build_embedding_index(model, chem_train_scaled, sensory_train_scaled)
+
+    # 2) 새 샘플 하나 선택 (예: chemical_df에서 임의 행)
+    new_row = chemical_df.loc[123, chem_cols]  # chem_cols 순서대로
+
+    # 3) 가장 가까운 감각 샘플 5개 찾기
+    idxs, sims = find_nearest_samples(
+        model,
+        chem_scaler,
+        chem_index, sens_index,
+        new_row.values,
+        top_k=5,
+        use_sensory=True
+    )
+
+    print("idx 123와 가장 Top-5 가까운 샘플 인덱스:", idxs)
+    print("각각의 cosine similarity:", sims)
+    # 필요하면 idxs를 이용해 원래 DataFrame에서 beer_name, description 등 조회
 
 if __name__ == "__main__":
     main()
