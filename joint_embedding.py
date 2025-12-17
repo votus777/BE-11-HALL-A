@@ -49,13 +49,14 @@ class BeerPairDataset(Dataset):
 # ============================================
 
 class MLPEncoder(nn.Module):
-    def __init__(self, input_dim, latent_dim=32, hidden_dims=(512, 256, 128, 128, 64, 32)):
+    def __init__(self, input_dim, latent_dim=32, hidden_dims=(512, 256)):
         super().__init__()
         layers = []
         prev_dim = input_dim
         for h in hidden_dims:
             layers.append(nn.Linear(prev_dim, h))
-            layers.append(nn.BatchNorm1d(h))
+            # layers.append(nn.BatchNorm1d(h))
+            layers.append(nn.LayerNorm(h))
             layers.append(nn.ReLU(inplace=True))
             prev_dim = h
         layers.append(nn.Linear(prev_dim, latent_dim))
@@ -66,10 +67,10 @@ class MLPEncoder(nn.Module):
 
 
 class TwoTowerModel(nn.Module):
-    def __init__(self, chem_dim, sensory_dim, latent_dim=32):
+    def __init__(self, chem_dim, sensory_dim, latent_dim=256):
         super().__init__()
-        self.chem_encoder = MLPEncoder(chem_dim, latent_dim=latent_dim, hidden_dims=(32, 16))
-        self.sensory_encoder = MLPEncoder(sensory_dim, latent_dim=latent_dim, hidden_dims=(128, 64))
+        self.chem_encoder = MLPEncoder(chem_dim, latent_dim=latent_dim, hidden_dims=(512, 256 ))
+        self.sensory_encoder = MLPEncoder(sensory_dim, latent_dim=latent_dim, hidden_dims=(512, 256))
 
     def forward(self, chem_input, sensory_input):
         chem_latent = self.chem_encoder(chem_input)
@@ -82,7 +83,7 @@ class TwoTowerModel(nn.Module):
 # 3. Contrastive Loss
 # ============================================
 
-def contrastive_batch_loss(chem_latent, sensory_latent, margin=0.3):
+def contrastive_batch_loss(chem_latent, sensory_latent, margin=0.2):
     """
     - 같은 인덱스 (i,i): positive pair
     - 배치 내에서 permute된 sensory_latent를 negative로 사용.
@@ -100,17 +101,37 @@ def contrastive_batch_loss(chem_latent, sensory_latent, margin=0.3):
     loss = pos_loss.mean() + neg_loss.mean()
     return loss, pos_cos.mean().item(), neg_cos.mean().item()
 
+# def contrastive_batch_loss(chem_latent, sensory_latent, margin=0.2, alpha=2.0):
+#     """
+#     - 같은 인덱스 (i,i): positive pair
+#     - 배치 내에서 permute된 sensory_latent를 negative로 사용.
+#     - hard negative(양/음 코사인 차이가 작은 샘플)에 더 큰 가중치를 부여.
+#     """
+#     batch_size = chem_latent.size(0)
 
-# (옵션) InfoNCE 로스는 당분간 사용 안 하면 그대로 두고 주석 유지
-def info_nce_loss(chem_latent, sensory_latent, tau=0.08):
-    logits = (chem_latent @ sensory_latent.T) / tau
-    labels = torch.arange(logits.size(0), device=logits.device)
-    loss = F.cross_entropy(logits, labels)
-    with torch.no_grad():
-        pos = torch.diag(logits).mean()
-        neg = (logits.sum(dim=1) - torch.diag(logits)) / (logits.size(1) - 1)
-        neg = neg.mean()
-    return loss, pos.item(), neg.item()
+#     # 1) positive cosine
+#     pos_cos = F.cosine_similarity(chem_latent, sensory_latent, dim=1)  # (B,)
+
+#     # 2) negative pair 생성
+#     perm = torch.randperm(batch_size, device=chem_latent.device)
+#     neg_sensory = sensory_latent[perm]
+#     neg_cos = F.cosine_similarity(chem_latent, neg_sensory, dim=1)     # (B,)
+
+#     # 3) 기본 loss
+#     pos_loss = 1.0 - pos_cos                         # (B,)
+#     base_neg_loss = torch.relu(neg_cos - margin)     # (B,)
+
+#     # 4) hard negative weight 계산
+#     #    delta = pos - neg 가 작을수록(혹은 neg >= pos) hard하다고 보고 가중치 ↑
+#     delta = pos_cos - neg_cos                        # (B,)
+#     hard_factor = torch.relu(-delta)                 # neg >= pos인 샘플이 클수록 ↑
+#     w = 1.0 + alpha * hard_factor                    # (B,)
+
+#     # 5) weighted negative loss
+#     neg_loss = base_neg_loss * w
+
+#     loss = pos_loss.mean() + neg_loss.mean()
+#     return loss, pos_cos.mean().item(), neg_cos.mean().item()
 
 
 # 4. Training Loop
@@ -162,7 +183,6 @@ def train_model(
             chem_latent, sensory_latent = model(chem_batch, sensory_batch)
 
             loss, pos_cos_mean, neg_cos_mean = contrastive_batch_loss(chem_latent, sensory_latent)
-            # loss, pos_cos_mean, neg_cos_mean = info_nce_loss(chem_latent, sensory_latent)
 
             loss.backward()
             optimizer.step()
@@ -403,7 +423,7 @@ def main():
         chem_train_scaled,
         sensory_train_scaled,
         n_epochs=300,
-        batch_size=32,
+        batch_size=128,
         lr=1e-3
     )
 
